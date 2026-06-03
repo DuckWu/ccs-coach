@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>CCS Coach</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body class="panel">
+    <header>
+      <div>
+        <h1>CCS Coach</h1>
+        <p id="summary">Ready</p>
+      </div>
+      <button id="newCase" type="button">New Case</button>
+    </header>
+
+    <main id="messages" aria-live="polite"></main>
+
+    <footer>
+      <button id="analyze" class="primary" type="button">Ask Coach</button>
+      <button id="feedback" type="button">Case Feedback</button>
+      <span id="tokenUsage"></span>
+    </footer>
+
+    <script src="sidepanel.js"></script>
+  </body>
+</html>

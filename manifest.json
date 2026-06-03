@@ -1,0 +1,50 @@
+{
+  "manifest_version": 3,
+  "name": "CCS Coach",
+  "version": "0.1.0",
+  "description": "Real-time CCS practice coaching from screenshots.",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "sidePanel",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "https://api.anthropic.com/*",
+    "https://open.bigmodel.cn/*",
+    "https://api.minimax.io/*",
+    "https://minnimax.chat/*",
+    "https://minimax.chat/*"
+  ],
+  "action": {
+    "default_title": "CCS Coach",
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "all_frames": true
+    }
+  ],
+  "commands": {
+    "analyze-screenshot": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+S",
+        "mac": "Command+Shift+S"
+      },
+      "description": "Analyze the current CCS screen"
+    }
+  }
+}

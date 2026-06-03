@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>CCS Coach</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body class="popup">
+    <main>
+      <h1>CCS Coach</h1>
+
+      <details class="settings-card">
+        <summary>
+          <span>
+            <strong>Model settings</strong>
+            <small id="modelSummary">Not configured</small>
+          </span>
+        </summary>
+
+        <div class="settings-body">
+          <label class="field">
+            <span>Provider API key</span>
+            <input id="apiKey" type="password" autocomplete="off" placeholder="sk-ant-...">
+          </label>
+
+          <div class="compact-grid">
+            <label class="field">
+              <span>Provider</span>
+              <select id="provider">
+                <option value="anthropic">Anthropic</option>
+                <option value="glm">GLM / BigModel</option>
+                <option value="minimax">MiniMax</option>
+              </select>
+            </label>
+
+            <label class="field">
+              <span>Language</span>
+              <select id="language">
+                <option value="zh">中文</option>
+                <option value="en">English</option>
+                <option value="bilingual">中英双语</option>
+              </select>
+            </label>
+          </div>
+
+          <label class="field">
+            <span>Model</span>
+            <select id="model"></select>
+          </label>
+
+          <label id="customModelField" class="field hidden">
+            <span>Custom model ID</span>
+            <input id="customModel" type="text" autocomplete="off" placeholder="claude-...">
+          </label>
+
+          <label class="field">
+            <span>Base URL</span>
+            <input id="baseUrl" type="url" autocomplete="off" placeholder="https://api.anthropic.com">
+          </label>
+
+          <div class="actions">
+            <button id="saveSettings" type="button">Save</button>
+            <button id="testModel" type="button">Test Model</button>
+          </div>
+        </div>
+      </details>
+
+      <button id="openPanel" type="button">Open Panel</button>
+
+      <label class="switch-row">
+        <span>
+          <strong>Coach on this page</strong>
+          <small>Show the floating case recorder</small>
+        </span>
+        <input id="coachToggle" type="checkbox">
+        <i aria-hidden="true"></i>
+      </label>
+
+      <button id="analyze" class="primary" type="button">Ask Coach</button>
+
+      <p id="status" class="status" role="status"></p>
+    </main>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

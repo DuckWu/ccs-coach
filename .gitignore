@@ -1,0 +1,16 @@
+# Chrome Extension build artifacts
+*.crx
+*.pem
+*.zip
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Node / dependencies
+node_modules/
