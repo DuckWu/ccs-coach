@@ -2,6 +2,9 @@ const DEFAULT_MODEL = "claude-sonnet-4-20250514";
 const DEFAULT_PROVIDER = "anthropic";
 const MAX_HISTORY_MESSAGES = 10;
 const MAX_CASE_EVENTS = 80;
+const ASK_MEMORY_CHAR_LIMIT = 18000;
+const STORAGE_STATE_KEY = "ccsCoachRuntimeState";
+const MAX_PANEL_ITEMS = 80;
 
 let items = [];
 let conversationHistory = [];
@@ -9,6 +12,8 @@ let caseEvents = [];
 let lastCaseEventSignature = "";
 let usage = {};
 let isLoading = false;
+let runtimeStateLoaded = false;
+let runtimeStateLoadPromise = null;
 
 async function loadSystemPrompt() {
   const response = await fetch(chrome.runtime.getURL("prompts/system.md"));
@@ -47,7 +52,62 @@ function getState() {
   };
 }
 
+function normalizeStoredArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function trimRuntimeState() {
+  items = items.slice(-MAX_PANEL_ITEMS);
+  conversationHistory = conversationHistory.slice(-MAX_HISTORY_MESSAGES);
+  caseEvents = caseEvents.slice(-MAX_CASE_EVENTS);
+}
+
+function serializeRuntimeState() {
+  trimRuntimeState();
+  return {
+    items,
+    conversationHistory,
+    caseEvents,
+    lastCaseEventSignature,
+    usage,
+    savedAt: new Date().toISOString()
+  };
+}
+
+async function loadRuntimeState() {
+  if (runtimeStateLoaded) return;
+  if (runtimeStateLoadPromise) return runtimeStateLoadPromise;
+
+  runtimeStateLoadPromise = chrome.storage.local.get(STORAGE_STATE_KEY)
+    .then((stored) => {
+      const state = stored[STORAGE_STATE_KEY];
+      if (state && typeof state === "object") {
+        items = normalizeStoredArray(state.items);
+        conversationHistory = normalizeStoredArray(state.conversationHistory);
+        caseEvents = normalizeStoredArray(state.caseEvents);
+        lastCaseEventSignature = state.lastCaseEventSignature
+          || (caseEvents.length ? getEventSignature(caseEvents.at(-1).text) : "");
+        usage = state.usage && typeof state.usage === "object" ? state.usage : {};
+        isLoading = false;
+        trimRuntimeState();
+      }
+      runtimeStateLoaded = true;
+    })
+    .finally(() => {
+      runtimeStateLoadPromise = null;
+    });
+
+  return runtimeStateLoadPromise;
+}
+
+function saveRuntimeState() {
+  chrome.storage.local.set({
+    [STORAGE_STATE_KEY]: serializeRuntimeState()
+  }).catch(() => {});
+}
+
 function broadcastState() {
+  saveRuntimeState();
   chrome.runtime.sendMessage({ type: "STATE_UPDATED", state: getState() }).catch(() => {});
 }
 
@@ -101,12 +161,19 @@ async function setPageCoach(tabId, enabled) {
 }
 
 async function openSidePanelForSender(sender) {
+  const tabId = sender?.tab?.id;
   const windowId = sender?.tab?.windowId;
-  if (!windowId) return;
+  if (!windowId) return { ok: false, error: "No sender window." };
+
   try {
+    if (tabId) {
+      // 注意：不要 await setOptions，避免把 open() 推出用户手势窗口。
+      chrome.sidePanel.setOptions({ tabId, path: "sidepanel.html", enabled: true }).catch(() => {});
+    }
     await chrome.sidePanel.open({ windowId });
-  } catch (_error) {
-    // Side panel opening is best-effort; analysis should still run.
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
 }
 
@@ -119,6 +186,36 @@ function extractFrameContextInPage() {
       && Number(style.opacity) !== 0
       && rect.width > 0
       && rect.height > 0;
+  }
+
+  function normalizeExtractedText(text) {
+    return String(text || "").replace(/\s+/g, " ").trim();
+  }
+
+  function isScrollableElement(element) {
+    const style = window.getComputedStyle(element);
+    const overflowY = style.overflowY;
+    const canScroll = overflowY === "auto" || overflowY === "scroll";
+    return canScroll && element.scrollHeight > element.clientHeight + 24;
+  }
+
+  function looksLikeVirtualScroll(element) {
+    const visibleRatio = element.clientHeight / Math.max(1, element.scrollHeight);
+    if (visibleRatio >= 0.85) return false;
+    const cls = (element.className || "").toString().toLowerCase();
+    const hasVirtualHint = /virtual|rv-|reactvirtualized|cdk-virtual|vue-recycle|infinite/i.test(cls)
+      || element.querySelector?.("[data-virtual-scroll], .cdk-virtual-scroll-content-wrapper");
+    return Boolean(hasVirtualHint);
+  }
+
+  function getElementText(element) {
+    if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
+      return element.value || element.placeholder || "";
+    }
+    if (element instanceof HTMLSelectElement) {
+      return element.selectedOptions?.[0]?.textContent || "";
+    }
+    return element.innerText || element.textContent || "";
   }
 
   const selectors = [
@@ -141,22 +238,34 @@ function extractFrameContextInPage() {
   const nodes = Array.from(document.body?.querySelectorAll(selectors) || []);
   const visibleText = nodes
     .filter(isVisible)
-    .map((element) => {
-      if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
-        return element.value || element.placeholder || "";
+    .map(getElementText)
+    .map(normalizeExtractedText)
+    .filter(Boolean);
+
+  const scrollableText = nodes
+    .filter((element) => isVisible(element) && isScrollableElement(element))
+    .map((element, index) => {
+      const text = normalizeExtractedText(element.textContent || getElementText(element));
+      if (!text) return "";
+      const maxScroll = Math.max(0, element.scrollHeight - element.clientHeight);
+      const remaining = Math.max(0, maxScroll - element.scrollTop);
+      const virtual = looksLikeVirtualScroll(element);
+      let note;
+      if (virtual) {
+        note = remaining > 24
+          ? "可能为虚拟滚动，未显示部分可能未被抓取，建议滚动到底部后再 Ask Coach"
+          : "可能为虚拟滚动，已滚到底部";
+      } else {
+        note = "完整文本（含当前未显示在视口内的部分）已抓取，可直接使用";
       }
-      if (element instanceof HTMLSelectElement) {
-        return element.selectedOptions?.[0]?.textContent || "";
-      }
-      return element.innerText || element.textContent || "";
+      return `[Scrollable window ${index + 1}: ${note}]\n${text}`;
     })
-    .map((text) => text.replace(/\s+/g, " ").trim())
     .filter(Boolean);
 
   return {
     title: document.title,
     url: location.href,
-    text: Array.from(new Set(visibleText)).join("\n").slice(0, 5000)
+    text: Array.from(new Set([...visibleText, ...scrollableText])).join("\n").slice(0, 9000)
   };
 }
 
@@ -178,7 +287,7 @@ async function extractAllFrameContext(tabId) {
       text: frames
         .map((frame, index) => `Frame ${index + 1}: ${frame.title || frame.url}\n${frame.text}`)
         .join("\n\n")
-        .slice(0, 12000)
+        .slice(0, 18000)
     };
   } catch (_error) {
     return null;
@@ -189,12 +298,12 @@ async function captureCurrentTabWithContext() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab?.windowId) throw new Error("No active tab found.");
 
-  const pageContext = await extractAllFrameContext(tab.id)
-    || await sendTabMessage(tab.id, { type: "EXTRACT_PAGE_CONTEXT" });
   await sendTabMessage(tab.id, { type: "SET_WIDGET_HIDDEN", hidden: true });
-  await delay(120);
+  await delay(240);
 
   try {
+    const pageContext = await extractAllFrameContext(tab.id)
+      || await sendTabMessage(tab.id, { type: "EXTRACT_PAGE_CONTEXT" });
     const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
     return {
       base64Image: dataUrl.replace(/^data:image\/png;base64,/, ""),
@@ -254,47 +363,175 @@ function buildLanguageInstruction(language) {
   return "请用中文回答。医学 order 名称保持英文。";
 }
 
+function includesAny(text, patterns) {
+  return patterns.some((pattern) => pattern.test(text));
+}
+
+function getStateChangeScore(event) {
+  const text = normalizeText(event.text).toLowerCase();
+  const hasNegativeResultLanguage = includesAny(text, [
+    /\b(no acute abnormality|within normal limits|normal limits|negative|ruled out|unremarkable|no evidence of)\b/i
+  ]);
+
+  const hasAbnormalResult = !hasNegativeResultLanguage && includesAny(text, [
+    /\b(high|low|critical|positive|elevated|increased|decreased|abnormal)\b/i,
+    /\b(h|l)\s*$/i,
+    /\btroponin\b.*\b(positive|elevated|high|abnormal)\b/i,
+    /\blactate\b.*\b(elevated|high|increased|abnormal)\b/i,
+    /\babg\b.*\b(acidosis|hypox|hypercap|low|high|abnormal)\b/i,
+    /\bct\b.*\b(dissection|bleed|embol|infarct|mass|rupture|abnormal)\b/i,
+    /\bcxr\b.*\b(pneumothorax|infiltrate|edema|effusion|abnormal)\b/i,
+    /\becg\b.*\b(stemi|ischemia|arrhythmia|tachycardia|abnormal)\b/i
+  ]);
+
+  const hasLocationChange = includesAny(text, [
+    /\b(change location|emergency department|intensive care|icu|ward|operating room|admit|transfer)\b/i
+  ]);
+
+  const hasNewTreatment = includesAny(text, [
+    /\b(start|administer|give|begin|ordered|order placed)\b.*\b(antibiotic|antibiotics|ceftriaxone|azithromycin|vancomycin|piperacillin|insulin|heparin|aspirin|nitroglycerin|beta.?blocker|magnesium|morphine|naloxone|dextrose|thiamine|oxygen|iv fluids|normal saline|saline|vasopressor|needle thoracostomy|chest tube)\b/i,
+    /\b(antibiotic|antibiotics|ceftriaxone|azithromycin|vancomycin|piperacillin|insulin|heparin|aspirin|nitroglycerin|magnesium sulfate|mgso4|oxygen|iv fluids|normal saline|chest tube|needle thoracostomy)\b/i
+  ]);
+
+  const hasCriticalTimingAnchor = includesAny(text, [
+    /\b(blood cultures?|urine culture|sputum culture|cultures? x ?2)\b/i,
+    /\b(potassium replacement|potassium repletion|k replacement)\b/i
+  ]);
+
+  const hasDeterioration = includesAny(text, [
+    /\b(worse|worsening|unresponsive|confused|obtunded|syncope|seizure|shock|distress|hypotension|hypoxic|cyanotic|tachypnea|tachycardia|chest pain|respiratory distress)\b/i,
+    /\bblood pressure\b.*\b([0-8]?\d\/|systolic.*[0-8]?\d)\b/i
+  ]);
+
+  if (hasDeterioration) return 4;
+  if (hasNewTreatment) return 3;
+  if (hasCriticalTimingAnchor) return 3;
+  if (hasLocationChange) return 2;
+  if (hasAbnormalResult) return 1;
+  return 0;
+}
+
+function isStateChangeEvent(event) {
+  return getStateChangeScore(event) > 0;
+}
+
+function uniqueEvents(events) {
+  const seen = new Set();
+  const result = [];
+  for (const event of events) {
+    const signature = getEventSignature(event.text);
+    if (seen.has(signature)) continue;
+    seen.add(signature);
+    result.push(event);
+  }
+  return result;
+}
+
+function formatMemoryEvent(event, index, label, textLimit) {
+  const text = event.text.length > textLimit
+    ? `${event.text.slice(0, textLimit)}\n[Event text clipped]`
+    : event.text;
+  return `${label} ${index + 1} [${event.source}] ${event.at}\n${text}`;
+}
+
+function buildMemoryText(eventsWithLabels, textLimits) {
+  return eventsWithLabels
+    .filter((entry) => textLimits[entry.label] > 0)
+    .map((entry, index) => formatMemoryEvent(entry.event, index, entry.label, textLimits[entry.label]))
+    .join("\n\n---\n\n");
+}
+
 function buildRecentCaseMemory() {
+  const header =
+    "【本 case 记忆】事件时间戳是用户真实操作时间（墙钟），不是 case 内 simulated time；"
+    + "timing/sequencing 判断以截图里的 simulated time 为准。"
+    + "Opening=开场原文（完整、最可信）；State-change=中途改变病情或处理方向的事件；Recent=最近上下文。\n\n";
+
   if (!caseEvents.length) {
-    return "目前没有记录到病例时间线。若用户已经点过最开始弹窗，说明插件启动太晚，不能假装知道之前内容。";
+    return header
+      + "目前没有记录到病例时间线。若用户已经点过最开始的弹窗，说明插件启动太晚，"
+      + "不能假装知道之前内容，应说明信息不足。";
   }
 
-  return caseEvents
-    .slice(-20)
-    .map((event, index) => {
-      return `Memory ${index + 1} [${event.source}] ${event.at}\n${event.text.slice(0, 1800)}`;
-    })
-    .join("\n\n---\n\n")
-    .slice(0, 18000);
+  const opening = caseEvents.slice(0, 6);
+  const recent = caseEvents.slice(-20);
+  const recentSet = new Set(recent);
+  const openingSet = new Set(opening);
+
+  const middleCandidates = caseEvents
+    .filter((event) => !openingSet.has(event) && !recentSet.has(event))
+    .filter(isStateChangeEvent)
+    .map((event) => ({ event, score: getStateChangeScore(event), index: caseEvents.indexOf(event) }))
+    .sort((a, b) => b.score - a.score || b.index - a.index)
+    .slice(0, 18)
+    .sort((a, b) => a.index - b.index)
+    .map((entry) => entry.event);
+
+  const selected = uniqueEvents([...opening, ...middleCandidates, ...recent])
+    .sort((a, b) => caseEvents.indexOf(a) - caseEvents.indexOf(b));
+
+  const eventsWithLabels = selected.map((event) => ({
+    event,
+    label: openingSet.has(event)
+      ? "Opening"
+      : recentSet.has(event)
+        ? "Recent"
+        : "State-change"
+  }));
+
+  const OPENING_FULL = 5000;
+  const limitProfiles = [
+    { Opening: OPENING_FULL, "State-change": 300, Recent: 450 },
+    { Opening: OPENING_FULL, "State-change": 220, Recent: 360 },
+    { Opening: OPENING_FULL, "State-change": 160, Recent: 300 },
+    { Opening: OPENING_FULL, "State-change": 0, Recent: 260 },
+    { Opening: OPENING_FULL, "State-change": 0, Recent: 200 }
+  ];
+
+  for (const profile of limitProfiles) {
+    const memoryText = buildMemoryText(eventsWithLabels, profile);
+    if ((header + memoryText).length <= ASK_MEMORY_CHAR_LIMIT) return header + memoryText;
+  }
+
+  const openingOnly = eventsWithLabels.filter((entry) => entry.label !== "State-change");
+  const fallbackText = buildMemoryText(openingOnly, {
+    Opening: OPENING_FULL,
+    "State-change": 0,
+    Recent: 160
+  });
+
+  if ((header + fallbackText).length <= ASK_MEMORY_CHAR_LIMIT) {
+    return header + fallbackText;
+  }
+
+  const openingEntries = eventsWithLabels.filter((entry) => entry.label === "Opening");
+  const openingText = buildMemoryText(openingEntries, { Opening: OPENING_FULL, "State-change": 0, Recent: 0 });
+  const budgetLeft = ASK_MEMORY_CHAR_LIMIT - header.length - openingText.length - 64;
+
+  if (budgetLeft <= 0) {
+    const clipped = (header + openingText).slice(0, ASK_MEMORY_CHAR_LIMIT);
+    return `${clipped}\n\n[警告：Opening 过长被截断，开场信息可能不完整，回答时需说明。]`;
+  }
+
+  const recentEntries = eventsWithLabels.filter((entry) => entry.label === "Recent");
+  let recentText = buildMemoryText(recentEntries, { Opening: 0, "State-change": 0, Recent: 200 });
+  if (recentText.length > budgetLeft) {
+    recentText = `${recentText.slice(0, budgetLeft)}\n[Recent clipped]`;
+  }
+
+  return `${header}${openingText}\n\n---\n\n${recentText}`;
 }
 
 function buildScreenshotPrompt(language, pageContext) {
   const visibleText = pageContext?.text
-    ? `\n\n当前页面可见文字/弹窗文字如下，优先结合这些文字判断：\n${pageContext.text}`
+    ? `\n\n【当前页面/弹窗/滚动窗口文字】优先结合这些文字与截图判断：\n${pageContext.text}`
     : "";
   const caseMemory = buildRecentCaseMemory();
 
   return `${buildLanguageInstruction(language)}
-这是当前 USMLE Step 3 CCS / Primum 界面截图。请给用户“此刻下一步”建议，而不是复盘。
 
-重要规则：
-- 你必须结合“本 case 已记录时间线”和当前画面回答，不要只看当前弹窗。
-- 只有当画面明确是 Help / About / Exam Interface / Timer Info / Question Status / Answering Questions 这种软件说明弹窗时，才提示关闭。
-- Reevaluate、Obtain Results、See Patient Later、With next available result、Order Entry、Location、History、Physical、Vitals、Labs 都是病例操作窗口，必须给医学和流程建议。
-- 不要告诉用户点击不存在的 Start Case。插件只有 New Case，且只应在新病例开始前使用。
-- 输出要清楚，不能只给一句话。用下面固定结构：
-  ## 当前判断
-  说明当前 case 最可能的问题、稳定性、你已经知道的关键信息。
-  ## 现在该做
-  给 3-8 条具体动作或 order，按优先级排列。
-  ## 为什么
-  简短说明 timing / sequencing / location 的理由。
-  ## 别踩坑
-  提醒当前界面最容易扣分的 1-3 个点。
-- 每个 order 用英文名称，后面用中文解释。
-- 不要输出 Markdown 表格。
+【模式：Ask Coach】请按 system prompt 中 "Ask Coach 输出" 的固定结构，给出"此刻下一步"建议，不要复盘整场。结合下面的记忆与当前截图/页面文字回答；信息不足时说明，不要编造未记录的 order、结果或诊断。
 
-本 case 已记录时间线：
 ${caseMemory}
 
 ${visibleText}`;
@@ -302,40 +539,17 @@ ${visibleText}`;
 
 function buildCaseFeedbackPrompt(language) {
   const timeline = caseEvents
-    .map((event, index) => {
-      return `#${index + 1} [${event.source}] ${event.at}\n${event.text}`;
-    })
+    .map((event, index) => `#${index + 1} [${event.source}] ${event.at}\n${event.text}`)
     .join("\n\n---\n\n");
 
+  const timeNote =
+    "（注：时间戳为真实操作时间，非 case 内 simulated time。）\n\n";
+
   return `${buildLanguageInstruction(language)}
-你现在不是只给下一步建议，而是做 CCS case 复盘教练。下面是本 case 自动记录到的页面/弹窗/医嘱/结果时间线。
 
-请分析用户的选择和操作习惯，输出：
+【模式：End Case & Feedback】用户想要整场复盘，不是当前一屏的下一步。请严格按 system prompt 中 "End Case & Feedback 输出" 的结构作答，只基于下面的时间线，不要编造未记录内容，不要列不适用于本患者的模板项。
 
-## Case 判断
-- 最可能诊断/主问题
-- 当前病人稳定性和关键危险点
-
-## 用户已经做对的
-- 按 timing / sequencing / location / workup / treatment 分类
-
-## 用户可能漏掉或做晚的
-- 具体 order 名称
-- 为什么会扣分
-- 应该在什么时机做
-
-## 用户特点
-- 例如：是否过度检查、是否治疗太晚、是否忘记监测、是否 location 不果断、是否收尾空白
-
-## 下一步建议
-- 现在立刻该做的 3-8 个具体 order 或操作
-
-## 训练重点
-- 这位用户后面练 CCS 时最该盯住的 3 个习惯
-
-如果时间线信息不足，请明确说“不足”，不要编造用户已经做过的 order。
-
-时间线：
+${timeNote}【完整时间线】
 ${timeline || "No recorded events yet."}`;
 }
 
@@ -456,37 +670,6 @@ async function analyzeWithGlm(base64Image, settings, systemPrompt, pageContext) 
     usage: responseJson.usage || {}
   };
 }
-
-function buildOpenAiVisionMessages(base64Image, settings, systemPrompt, pageContext) {
-  const history = getRecentTextHistory().map((message) => ({
-    role: message.role,
-    content: message.content
-  }));
-
-  return [
-    {
-      role: "system",
-      content: systemPrompt
-    },
-    ...history,
-    {
-      role: "user",
-      content: [
-        {
-          type: "text",
-          text: buildScreenshotPrompt(settings.language, pageContext)
-        },
-        {
-          type: "image_url",
-          image_url: {
-            url: `data:image/png;base64,${base64Image}`
-          }
-        }
-      ]
-    }
-  ];
-}
-
 async function analyzeWithMiniMax(base64Image, settings, systemPrompt, pageContext) {
   const userMessage = buildAnthropicScreenshotMessage(base64Image, settings.language, pageContext);
   const history = getRecentTextHistory().map((message) => ({
@@ -594,6 +777,7 @@ async function sendTextToGlm(settings, systemPrompt, prompt) {
 }
 
 async function generateCaseFeedback() {
+  await loadRuntimeState();
   if (isLoading) return { ok: false, error: "Analysis already in progress." };
   if (!caseEvents.length) return { ok: false, error: "No case events recorded yet." };
 
@@ -631,10 +815,12 @@ async function generateCaseFeedback() {
 }
 
 async function testModelConnection() {
+  await loadRuntimeState();
   const startedAt = performance.now();
+  let settings;
 
   try {
-    const settings = await getSettings();
+    settings = await getSettings();
     if (!settings.apiKey) throw new Error("Please save your API key first.");
 
     const systemPrompt = "You are a connection test assistant. Keep replies short.";
@@ -656,9 +842,9 @@ async function testModelConnection() {
     const message = error instanceof Error ? error.message : String(error);
     return {
       ok: false,
-      provider: settings.provider,
-      model: settings.model,
-      baseUrl: settings.baseUrl,
+      provider: settings?.provider,
+      model: settings?.model,
+      baseUrl: settings?.baseUrl,
       latencyMs: Math.round(performance.now() - startedAt),
       error: message
     };
@@ -666,6 +852,7 @@ async function testModelConnection() {
 }
 
 async function analyzeScreenshot(base64Image, pageContext) {
+  await loadRuntimeState();
   const settings = await getSettings();
   if (!settings.apiKey) throw new Error("Please save your API key first.");
 
@@ -689,12 +876,14 @@ async function analyzeScreenshot(base64Image, pageContext) {
     role: "assistant",
     content: result.text
   });
+  conversationHistory = conversationHistory.slice(-MAX_HISTORY_MESSAGES);
   usage = result.usage;
 
   return result.text;
 }
 
 async function runAnalysis() {
+  await loadRuntimeState();
   if (isLoading) return { ok: false, error: "Analysis already in progress." };
 
   isLoading = true;
@@ -733,52 +922,74 @@ function resetCase() {
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message.type === "GET_STATE") {
-    sendResponse(getState());
-    return false;
+  let responded = false;
+  function safeSendResponse(response) {
+    if (responded) return;
+    responded = true;
+    sendResponse(response);
   }
 
-  if (message.type === "NEW_CASE") {
-    resetCase();
-    sendResponse({ ok: true });
-    return false;
-  }
+  // 关键修复：sidePanel.open() 必须在用户手势"新鲜"时调用。
+  // 在任何 await（包括 loadRuntimeState）之前同步发起开 panel，拿到 promise，
+  // 后面在对应分支里再 await 结果。否则手势会在 await 期间过期，open() 被拒。
+  const panelPromise = (message.openPanel
+    && (message.type === "ANALYZE_SCREENSHOT" || message.type === "CASE_FEEDBACK"))
+    ? openSidePanelForSender(_sender)
+    : Promise.resolve({ ok: false });
+  panelPromise.catch(() => {});
 
-  if (message.type === "SET_PAGE_COACH") {
-    setPageCoach(message.tabId, Boolean(message.enabled)).then(sendResponse);
-    return true;
-  }
+  (async () => {
+    await loadRuntimeState();
 
-  if (message.type === "ANALYZE_SCREENSHOT") {
-    if (message.openPanel) openSidePanelForSender(_sender);
-    runAnalysis().then(sendResponse);
-    return true;
-  }
+    if (message.type === "GET_STATE") {
+      safeSendResponse(getState());
+      return;
+    }
 
-  if (message.type === "TEST_MODEL") {
-    testModelConnection().then(sendResponse).catch((error) => {
-      sendResponse({
-        ok: false,
-        latencyMs: 0,
-        error: error instanceof Error ? error.message : String(error)
-      });
+    if (message.type === "NEW_CASE") {
+      resetCase();
+      safeSendResponse({ ok: true });
+      return;
+    }
+
+    if (message.type === "SET_PAGE_COACH") {
+      safeSendResponse(await setPageCoach(message.tabId, Boolean(message.enabled)));
+      return;
+    }
+
+    if (message.type === "ANALYZE_SCREENSHOT") {
+      const panel = await panelPromise;
+      const result = await runAnalysis();
+      safeSendResponse({ ...result, panelOpened: Boolean(panel.ok), panelError: panel.error || "" });
+      return;
+    }
+
+    if (message.type === "TEST_MODEL") {
+      safeSendResponse(await testModelConnection());
+      return;
+    }
+
+    if (message.type === "CASE_FEEDBACK") {
+      const panel = await panelPromise;
+      const result = await generateCaseFeedback();
+      safeSendResponse({ ...result, panelOpened: Boolean(panel.ok), panelError: panel.error || "" });
+      return;
+    }
+
+    if (message.type === "RECORD_CONTEXT") {
+      const recorded = addCaseEvent(message.event);
+      safeSendResponse({ ok: true, recorded, count: caseEvents.length });
+      return;
+    }
+
+    safeSendResponse({ ok: false, error: "Unknown message type." });
+  })().catch((error) => {
+    safeSendResponse({
+      ok: false,
+      error: error instanceof Error ? error.message : String(error)
     });
-    return true;
-  }
-
-  if (message.type === "CASE_FEEDBACK") {
-    if (message.openPanel) openSidePanelForSender(_sender);
-    generateCaseFeedback().then(sendResponse);
-    return true;
-  }
-
-  if (message.type === "RECORD_CONTEXT") {
-    const recorded = addCaseEvent(message.event);
-    sendResponse({ ok: true, recorded, count: caseEvents.length });
-    return false;
-  }
-
-  return false;
+  });
+  return true;
 });
 
 chrome.commands.onCommand.addListener((command) => {

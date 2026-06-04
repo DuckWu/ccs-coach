@@ -155,6 +155,21 @@ async function sendTabMessage(tabId, message) {
   return chrome.tabs.sendMessage(tabId, message);
 }
 
+async function getCoachStateOnTab(tabId) {
+  try {
+    const response = await sendTabMessage(tabId, { type: "PING" });
+    return {
+      available: Boolean(response?.ok),
+      enabled: Boolean(response?.widgetEnabled)
+    };
+  } catch (_error) {
+    return {
+      available: false,
+      enabled: false
+    };
+  }
+}
+
 async function ensureCoachScript(tabId) {
   try {
     const ping = await sendTabMessage(tabId, { type: "PING" });
@@ -171,6 +186,17 @@ async function ensureCoachScript(tabId) {
     target: { tabId },
     files: ["content.js"]
   });
+}
+
+async function syncCoachToggleFromActiveTab() {
+  const tab = await getActiveTab();
+  if (!tab?.id) {
+    coachToggle.checked = false;
+    return;
+  }
+
+  const state = await getCoachStateOnTab(tab.id);
+  coachToggle.checked = state.enabled;
 }
 
 async function setCoachOnTab(tabId, enabled) {
@@ -345,13 +371,4 @@ document.getElementById("testModel").addEventListener("click", async () => {
   }
 });
 
-document.getElementById("analyze").addEventListener("click", async () => {
-  const saved = await saveSettings();
-  if (!saved) return;
-  await openPanel();
-  setStatusState("pending", "Analyzing current screen...");
-  const response = await sendBackgroundMessage({ type: "ANALYZE_SCREENSHOT" });
-  setStatusState(response?.ok ? "success" : "error", response?.ok ? "Analysis sent to panel." : response?.error || "Failed.");
-});
-
-loadSettings();
+loadSettings().then(syncCoachToggleFromActiveTab);
